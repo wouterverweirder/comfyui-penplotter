@@ -131,13 +131,229 @@ class ImageToCenterline:
             return (f"Error: {str(e)}",)
 
 
+class OptimizeSVG:
+    CATEGORY = "Pen Plotter"
+    
+    @classmethod    
+    def INPUT_TYPES(s):
+        return { 
+            "required": { 
+                "svg_string": ("STRING", {"multiline": True}),
+            },
+            "optional": {
+                "fit_to_margins": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 50.0, "step": 0.1}),
+                "landscape": ("BOOLEAN", {"default": True}),
+                "linemerge": ("BOOLEAN", {"default": True}),
+                "tolerance": ("FLOAT", {"default": 0.1, "min": 0.01, "max": 5.0, "step": 0.01}),
+                "linesort": ("BOOLEAN", {"default": True}),
+                "reloop": ("BOOLEAN", {"default": True}),
+                "linesimplify": ("BOOLEAN", {"default": True}),
+                "page_width": ("FLOAT", {"default": 100.0, "min": 10.0, "max": 500.0, "step": 1.0}),
+                "page_height": ("FLOAT", {"default": 148.0, "min": 10.0, "max": 500.0, "step": 1.0}),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("optimized_svg",)
+    FUNCTION = "optimize_svg"
+
+    def run_vpype_command(self, input_path, output_path, fit_to_margins, landscape, linemerge, 
+                         tolerance, linesort, reloop, linesimplify, page_width, page_height):
+        """Run vpype command with specified parameters."""
+        try:
+            # Build the vpype command
+            cmd = ['vpype', 'read', str(input_path)]
+            
+            # Add layout command with fit-to-margins and landscape options
+            layout_cmd = ['layout', f'--fit-to-margins', f'{fit_to_margins}mm']
+            if landscape:
+                layout_cmd.extend(['--landscape', f'{page_width}x{page_height}mm'])
+            else:
+                layout_cmd.append(f'{page_width}x{page_height}mm')
+            cmd.extend(layout_cmd)
+            
+            # Add linemerge if enabled
+            if linemerge:
+                cmd.extend(['linemerge', '--tolerance', f'{tolerance}mm'])
+            
+            # Add linesort if enabled
+            if linesort:
+                cmd.append('linesort')
+            
+            # Add reloop if enabled
+            if reloop:
+                cmd.append('reloop')
+            
+            # Add linesimplify if enabled
+            if linesimplify:
+                cmd.append('linesimplify')
+            
+            # Add write command with page size
+            cmd.extend(['write', '--page-size', f'{page_width}x{page_height}mm', str(output_path)])
+            
+            # Execute the command
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                return True
+            else:
+                print(f"Error running vpype: {result.stderr}")
+                return False
+                
+        except FileNotFoundError:
+            print("Error: vpype command not found. Please ensure vpype is installed and in your PATH.")
+            return False
+        except Exception as e:
+            print(f"Error running vpype: {e}")
+            return False
+
+    def optimize_svg(self, svg_string, fit_to_margins=0.0, landscape=True, linemerge=True, 
+                    tolerance=0.1, linesort=True, reloop=True, linesimplify=True, 
+                    page_width=100.0, page_height=148.0):
+        """Optimize SVG string using vpype."""
+        try:
+            # Create temporary files
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                input_svg_path = temp_path / "input.svg"
+                output_svg_path = temp_path / "output.svg"
+                
+                # Write input SVG to temporary file
+                with open(input_svg_path, 'w', encoding='utf-8') as f:
+                    f.write(svg_string)
+                
+                # Run vpype command
+                if not self.run_vpype_command(
+                    input_svg_path, output_svg_path, fit_to_margins, landscape, 
+                    linemerge, tolerance, linesort, reloop, linesimplify, 
+                    page_width, page_height
+                ):
+                    return ("Error: Failed to run vpype optimization",)
+                
+                # Read the optimized SVG file and return as string
+                if output_svg_path.exists():
+                    with open(output_svg_path, 'r', encoding='utf-8') as f:
+                        optimized_svg = f.read()
+                    return (optimized_svg,)
+                else:
+                    return ("Error: Optimized SVG file was not created",)
+                    
+        except Exception as e:
+            return (f"Error: {str(e)}",)
+
+
+class PlotSVG:
+    CATEGORY = "Pen Plotter"
+    
+    @classmethod    
+    def INPUT_TYPES(s):
+        return { 
+            "required": { 
+                "svg_string": ("STRING", {"multiline": True}),
+            },
+            "optional": {
+                "layer": ("INT", {"default": 2, "min": 1, "max": 8, "step": 1}),
+                "preview_only": ("BOOLEAN", {"default": False}),
+                "pen_up_speed": ("INT", {"default": 75, "min": 1, "max": 100, "step": 1}),
+                "pen_down_speed": ("INT", {"default": 25, "min": 1, "max": 100, "step": 1}),
+                "pen_up_delay": ("INT", {"default": 0, "min": 0, "max": 5000, "step": 10}),
+                "pen_down_delay": ("INT", {"default": 0, "min": 0, "max": 5000, "step": 10}),
+                "copies": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1}),
+            }
+        }
+    
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("status",)
+    FUNCTION = "plot_svg"
+
+    def run_axicli_command(self, svg_path, layer, preview_only, pen_up_speed, pen_down_speed, 
+                          pen_up_delay, pen_down_delay, copies):
+        """Run axicli command with specified parameters."""
+        try:
+            # Build the axicli command
+            cmd = ['axicli', str(svg_path)]
+            
+            # Add layer parameter
+            cmd.extend(['-L', str(layer)])
+            
+            # Add preview mode if enabled
+            if preview_only:
+                cmd.append('-m')  # Preview mode
+            
+            # Add speed settings
+            cmd.extend(['-S', str(pen_up_speed)])   # Pen-up speed
+            cmd.extend(['-s', str(pen_down_speed)]) # Pen-down speed
+            
+            # Add delay settings
+            if pen_up_delay > 0:
+                cmd.extend(['-d', str(pen_up_delay)])   # Pen-up delay
+            if pen_down_delay > 0:
+                cmd.extend(['-D', str(pen_down_delay)]) # Pen-down delay
+            
+            # Add copies
+            if copies > 1:
+                cmd.extend(['-C', str(copies)])
+            
+            # Execute the command
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                return True, result.stdout
+            else:
+                print(f"Error running axicli: {result.stderr}")
+                return False, result.stderr
+                
+        except FileNotFoundError:
+            error_msg = "Error: axicli command not found. Please ensure AxiDraw software is installed and axicli is in your PATH."
+            print(error_msg)
+            return False, error_msg
+        except Exception as e:
+            error_msg = f"Error running axicli: {e}"
+            print(error_msg)
+            return False, error_msg
+
+    def plot_svg(self, svg_string, layer=2, preview_only=False, pen_up_speed=75, pen_down_speed=25,
+                pen_up_delay=0, pen_down_delay=0, copies=1):
+        """Send SVG to plotter using axicli."""
+        try:
+            # Create temporary file for the SVG
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                svg_path = temp_path / "plot.svg"
+                
+                # Write SVG to temporary file
+                with open(svg_path, 'w', encoding='utf-8') as f:
+                    f.write(svg_string)
+                
+                # Run axicli command
+                success, output = self.run_axicli_command(
+                    svg_path, layer, preview_only, pen_up_speed, pen_down_speed,
+                    pen_up_delay, pen_down_delay, copies
+                )
+                
+                if success:
+                    if preview_only:
+                        return ("Preview completed successfully. Check AxiDraw software for preview.",)
+                    else:
+                        return (f"Plot completed successfully. Copies: {copies}",)
+                else:
+                    return (f"Error: {output}",)
+                    
+        except Exception as e:
+            return (f"Error: {str(e)}",)
+
+
 # A dictionary that contains all nodes you want to export with their names
 # NOTE: names should be globally unique
 NODE_CLASS_MAPPINGS = {
-    "ImageToCenterline": ImageToCenterline
+    "ImageToCenterline": ImageToCenterline,
+    "OptimizeSVG": OptimizeSVG,
+    "PlotSVG": PlotSVG
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ImageToCenterline": "Image to Centerline SVG"
+    "ImageToCenterline": "Image to Centerline SVG",
+    "OptimizeSVG": "Optimize SVG with vpype",
+    "PlotSVG": "Plot SVG with AxiDraw"
 }

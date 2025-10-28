@@ -4,8 +4,10 @@ import tempfile
 import subprocess
 from pathlib import Path
 from server import PromptServer
-from PIL import Image
+import cv2
+from .trace_skeleton import thinning, traceSkeleton
 import comfy.model_management
+
 
 # Global variable to track the currently running subprocess for interruption
 _current_subprocess = None
@@ -28,110 +30,41 @@ class ImageToCenterline:
     RETURN_NAMES = ("svg_string",)
     FUNCTION = "convert_to_centerline"
 
-    def tensor_to_pil(self, tensor):
-        """Convert ComfyUI tensor to PIL Image."""
-        # ComfyUI images are in format [batch, height, width, channels] with values 0-1
-        if len(tensor.shape) == 4:
-            tensor = tensor[0]  # Take first image from batch
+    def tensor_to_cv2(self, tensor):
+        """Convert ComfyUI tensor to OpenCV image."""
+        # Convert tensor to numpy array
+        # ComfyUI tensors are in format (batch, height, width, channels)
+        np_image = tensor.cpu().numpy()
         
-        # Convert from 0-1 to 0-255 and to numpy
-        numpy_image = (tensor.cpu().numpy() * 255).astype(np.uint8)
+        # Get first image from batch if batched
+        if len(np_image.shape) == 4:
+            np_image = np_image[0]
         
-        # Convert to PIL Image
-        if numpy_image.shape[-1] == 3:  # RGB
-            return Image.fromarray(numpy_image, 'RGB')
-        elif numpy_image.shape[-1] == 1:  # Grayscale
-            return Image.fromarray(numpy_image.squeeze(-1), 'L')
-        else:
-            # Handle RGBA or other formats
-            return Image.fromarray(numpy_image, 'RGBA')
-
-    def convert_to_ppm(self, pil_image, output_path):
-        """Convert PIL image to PPM format."""
-        try:
-            # Convert to RGB if necessary (PPM doesn't support transparency)
-            if pil_image.mode in ('RGBA', 'LA'):
-                # Create a white background
-                background = Image.new('RGB', pil_image.size, (255, 255, 255))
-                if pil_image.mode == 'RGBA':
-                    background.paste(pil_image, mask=pil_image.split()[-1])  # Use alpha channel as mask
-                else:
-                    background.paste(pil_image, mask=pil_image.split()[-1])  # Use alpha channel as mask
-                pil_image = background
-            elif pil_image.mode != 'RGB':
-                pil_image = pil_image.convert('RGB')
-            
-            # Save as PPM
-            pil_image.save(output_path, 'PPM')
-            return True
-        except Exception as e:
-            print(f"Error converting image to PPM: {e}")
-            return False
-
-    def run_raster_retrace(self, ppm_path, svg_path, optimize_exhaustive=True):
-        """Run the raster-retrace command on a PPM file to generate SVG."""
-        global _current_subprocess
-        try:
-            # Build command with proper flags
-            cmd = [
-                'raster-retrace',
-                '-i', str(ppm_path),
-                '-o', str(svg_path),
-                '-m', 'CENTER'
-            ]
-            
-            if optimize_exhaustive:
-                cmd.append('--optimize-exhaustive')
-            
-            _current_subprocess = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            stdout, stderr = _current_subprocess.communicate()
-            
-            if _current_subprocess.returncode == 0:
-                _current_subprocess = None
-                return True
-            else:
-                print(f"Error running raster-retrace: {stderr}")
-                _current_subprocess = None
-                return False
-        except FileNotFoundError:
-            print("Error: raster-retrace command not found. Please ensure it's installed and in your PATH.")
-            _current_subprocess = None
-            return False
-        except Exception as e:
-            print(f"Error running raster-retrace: {e}")
-            _current_subprocess = None
-            return False
+        # Convert from float [0,1] to uint8 [0,255]
+        np_image = (np_image * 255).astype(np.uint8)
+        
+        # Convert RGB to BGR for OpenCV
+        return cv2.cvtColor(np_image, cv2.COLOR_RGB2BGR)
 
     def convert_to_centerline(self, image, optimize_exhaustive=True):
         """Convert image tensor to centerline SVG string."""
-        if Image is None:
-            return ("Error: PIL (Pillow) is required but not installed. Please install it with 'pip install Pillow'",)
             
         try:
-            # Convert tensor to PIL Image
-            pil_image = self.tensor_to_pil(image)
-            
-            # Create temporary files
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
-                ppm_path = temp_path / "temp_image.ppm"
-                svg_path = temp_path / "temp_output.svg"
-                
-                # Convert to PPM
-                if not self.convert_to_ppm(pil_image, str(ppm_path)):
-                    return ("Error: Failed to convert image to PPM format",)
-                
-                # Run raster-retrace
-                if not self.run_raster_retrace(ppm_path, svg_path, optimize_exhaustive):
-                    return ("Error: Failed to run raster-retrace conversion",)
-                
-                # Read the SVG file and return as string
-                if svg_path.exists():
-                    with open(svg_path, 'r', encoding='utf-8') as f:
-                        svg_content = f.read()
-                    return (svg_content,)
-                else:
-                    return ("Error: SVG file was not created",)
+
+            # create a cv2 image from PIL image
+            im0 = self.tensor_to_cv2(image)
+
+            # invert colors
+            im0 = 255 - im0
+
+            im = (im0[:,:,0]>128).astype(np.uint8)
+            im = thinning(im)
+            rects = []
+            polys = traceSkeleton(im,0,0,im.shape[1],im.shape[0],10,999,rects)
+
+            return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{im.shape[1]}" height="{im.shape[0]}"><path stroke="red" fill="none" d="'+" ".join(
+    ["M"+" ".join([f'{x[0]},{x[1]}' for x in y]) for y in polys]
+  )+'"/></svg>',)
                     
         except Exception as e:
             return (f"Error: {str(e)}",)

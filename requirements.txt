@@ -1,6 +1,7 @@
 # ComfyUI PenPlotter Dependencies
-# Image processing library
-Pillow>=9.0.0
+numpy>=2.3.4
+opencv-python
+numba
 
 # Vector drawing and plotting library
 vpype>=1.0.0

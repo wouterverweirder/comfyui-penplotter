@@ -2,9 +2,15 @@ from inspect import cleandoc
 import numpy as np
 import tempfile
 import subprocess
+import os
+from io import BytesIO
 from pathlib import Path
 from server import PromptServer
 import cv2
+import torch
+import requests
+import qrcode
+from PIL import Image
 from .trace_skeleton import thinning, traceSkeleton
 import comfy.model_management
 
@@ -358,13 +364,193 @@ def run_axicli_disengage():
         print(f"Error disengaging plotter: {e}")
         return False
 
+class ImageToFile:
+    """Wrap a ComfyUI IMAGE tensor as a PENPLOTTER_FILE for upload."""
+    CATEGORY = "Pen Plotter"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "name": ("STRING", {"default": "image.png"}),
+            }
+        }
+
+    RETURN_TYPES = ("PENPLOTTER_FILE",)
+    RETURN_NAMES = ("file",)
+    FUNCTION = "to_file"
+
+    def to_file(self, image, name):
+        np_image = image.cpu().numpy()
+        if np_image.ndim == 4:
+            np_image = np_image[0]
+        np_image = np.clip(np_image * 255.0, 0, 255).astype(np.uint8)
+        pil = Image.fromarray(np_image)
+        if pil.mode != "RGB":
+            pil = pil.convert("RGB")
+
+        buf = BytesIO()
+        pil.save(buf, format="PNG")
+
+        cleaned = (name or "image").strip() or "image"
+        if not os.path.splitext(cleaned)[1]:
+            cleaned = f"{cleaned}.png"
+
+        return ({
+            "name": cleaned,
+            "bytes": buf.getvalue(),
+            "mime": "image/png",
+        },)
+
+
+class SvgToFile:
+    """Wrap an SVG string as a PENPLOTTER_FILE for upload."""
+    CATEGORY = "Pen Plotter"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "svg_string": ("STRING", {"multiline": True, "forceInput": True}),
+                "name": ("STRING", {"default": "drawing.svg"}),
+            }
+        }
+
+    RETURN_TYPES = ("PENPLOTTER_FILE",)
+    RETURN_NAMES = ("file",)
+    FUNCTION = "to_file"
+
+    def to_file(self, svg_string, name):
+        cleaned = (name or "drawing").strip() or "drawing"
+        if not os.path.splitext(cleaned)[1]:
+            cleaned = f"{cleaned}.svg"
+
+        return ({
+            "name": cleaned,
+            "bytes": (svg_string or "").encode("utf-8"),
+            "mime": "image/svg+xml",
+        },)
+
+
+class UploadSubmission:
+    """POST collected files to the AI Plotter Laravel backend and render the
+    resulting public URL as a QR code image. The `project` widget is a label
+    for the operator's reference only — the project is derived server-side
+    from the API key."""
+    CATEGORY = "Pen Plotter"
+
+    _ERROR_CORRECTION = {
+        "L": qrcode.constants.ERROR_CORRECT_L,
+        "M": qrcode.constants.ERROR_CORRECT_M,
+        "Q": qrcode.constants.ERROR_CORRECT_Q,
+        "H": qrcode.constants.ERROR_CORRECT_H,
+    }
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "api_endpoint": ("STRING", {"default": "https://aiplotter.devine.be"}),
+                "project": ("STRING", {"default": ""}),
+                "api_key": ("STRING", {"default": ""}),
+                "box_size": ("INT", {"default": 10, "min": 1, "max": 50, "step": 1}),
+                "error_correction": (["L", "M", "Q", "H"], {"default": "M"}),
+            },
+            "optional": {
+                "file_1": ("PENPLOTTER_FILE",),
+                "file_2": ("PENPLOTTER_FILE",),
+                "file_3": ("PENPLOTTER_FILE",),
+                "file_4": ("PENPLOTTER_FILE",),
+                "file_5": ("PENPLOTTER_FILE",),
+                "file_6": ("PENPLOTTER_FILE",),
+                "file_7": ("PENPLOTTER_FILE",),
+                "file_8": ("PENPLOTTER_FILE",),
+                "file_9": ("PENPLOTTER_FILE",),
+                "file_10": ("PENPLOTTER_FILE",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("qr_code", "public_url", "token")
+    FUNCTION = "upload"
+
+    def upload(self, api_endpoint, project, api_key, box_size, error_correction,
+               file_1=None, file_2=None, file_3=None, file_4=None, file_5=None,
+               file_6=None, file_7=None, file_8=None, file_9=None, file_10=None):
+        slots = [file_1, file_2, file_3, file_4, file_5,
+                 file_6, file_7, file_8, file_9, file_10]
+        files = [f for f in slots if f is not None]
+        if not files:
+            raise RuntimeError("No files attached to UploadSubmission — wire at least one PENPLOTTER_FILE input.")
+
+        if not api_key.strip():
+            raise RuntimeError("UploadSubmission: api_key is empty.")
+        if not api_endpoint.strip():
+            raise RuntimeError("UploadSubmission: api_endpoint is empty.")
+
+        url = f"{api_endpoint.rstrip('/')}/api/v1/submissions"
+        files_payload = []
+        data_payload = {}
+        for i, f in enumerate(files):
+            files_payload.append((f"files[{i}][file]", (f["name"], f["bytes"], f["mime"])))
+            data_payload[f"files[{i}][label]"] = f["name"]
+
+        print(f"[PenPlotter] Uploading {len(files)} file(s) to {url}")
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key.strip()}",
+                "Accept": "application/json",
+            },
+            files=files_payload,
+            data=data_payload,
+            timeout=60,
+        )
+
+        if not response.ok:
+            body = response.text or ""
+            if len(body) > 800:
+                body = body[:800] + "…"
+            raise RuntimeError(f"UploadSubmission failed: HTTP {response.status_code} — {body}")
+
+        try:
+            payload = response.json()
+        except ValueError as e:
+            raise RuntimeError(f"UploadSubmission: response was not valid JSON — {response.text[:400]}") from e
+
+        public_url = payload.get("public_url", "")
+        token = payload.get("token", "")
+        if not public_url:
+            raise RuntimeError(f"UploadSubmission: response missing public_url — {payload}")
+
+        qr = qrcode.QRCode(
+            version=None,
+            error_correction=self._ERROR_CORRECTION[error_correction],
+            box_size=int(box_size),
+            border=4,
+        )
+        qr.add_data(public_url)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+
+        qr_np = np.array(qr_img).astype(np.float32) / 255.0
+        qr_tensor = torch.from_numpy(qr_np).unsqueeze(0)
+
+        print(f"[PenPlotter] Submission token={token} public_url={public_url}")
+        return (qr_tensor, public_url, token)
+
+
 # A dictionary that contains all nodes you want to export with their names
 # NOTE: names should be globally unique
 NODE_CLASS_MAPPINGS = {
     "ImageToCenterline": ImageToCenterline,
     "OptimizeSVG": OptimizeSVG,
     "PlotSVG": PlotSVG,
-    "DisengagePlotter": DisengagePlotter
+    "DisengagePlotter": DisengagePlotter,
+    "ImageToFile": ImageToFile,
+    "SvgToFile": SvgToFile,
+    "UploadSubmission": UploadSubmission
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -372,7 +558,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageToCenterline": "Image to Centerline SVG",
     "OptimizeSVG": "Optimize SVG with vpype",
     "PlotSVG": "Plot SVG with AxiDraw",
-    "DisengagePlotter": "Disengage Plotter"
+    "DisengagePlotter": "Disengage Plotter",
+    "ImageToFile": "Image to Submission File",
+    "SvgToFile": "SVG to Submission File",
+    "UploadSubmission": "Upload Submission to AI Plotter"
 }
 
 # Overwrite or wrap comfy.model_management.interrupt_current_processing

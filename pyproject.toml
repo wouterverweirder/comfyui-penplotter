@@ -17,6 +17,8 @@ dependencies = [
     "Pillow>=9.0.0",
     "vpype>=1.0.0",
     "https://cdn.evilmadscientist.com/dl/ad/public/AxiDraw_API.zip",
+    "requests",
+    "qrcode[pil]",
 ]
 
 

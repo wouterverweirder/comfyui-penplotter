@@ -3,6 +3,9 @@ import numpy as np
 import tempfile
 import subprocess
 import os
+import json
+import random
+import string
 from io import BytesIO
 from pathlib import Path
 from server import PromptServer
@@ -11,6 +14,8 @@ import torch
 import requests
 import qrcode
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
+import folder_paths
 from .trace_skeleton import thinning, traceSkeleton
 import comfy.model_management
 
@@ -211,9 +216,10 @@ class PlotSVG:
                 "pen_down_speed": ("INT", {"default": 25, "min": 1, "max": 100, "step": 1}),
                 "pen_up_delay": ("INT", {"default": 0, "min": 0, "max": 5000, "step": 10}),
                 "pen_down_delay": ("INT", {"default": 0, "min": 0, "max": 5000, "step": 10}),
+                "wait_for": ("STRING", {"forceInput": True}),
             }
         }
-    
+
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("status",)
     FUNCTION = "plot_svg"
@@ -264,7 +270,7 @@ class PlotSVG:
             return False, error_msg
 
     def plot_svg(self, svg_string, layer=2, pen_up_speed=75, pen_down_speed=25,
-                pen_up_delay=0, pen_down_delay=0):
+                pen_up_delay=0, pen_down_delay=0, wait_for=None):
         """Send SVG to plotter using axicli."""
         try:
             # Create temporary file for the SVG
@@ -534,11 +540,89 @@ class UploadSubmission:
         qr.make(fit=True)
         qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
 
+        # Push the QR to the frontend immediately, before downstream nodes
+        # (PlotSVG can take many minutes — we don't want the user staring at
+        # a spinner that long). QRCodePreview's own executed event still
+        # fires later but is redundant by then.
+        try:
+            temp_dir = folder_paths.get_temp_directory()
+            push_prefix = "qr_push_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+            push_folder, push_filename, push_counter, push_subfolder, _ = folder_paths.get_save_image_path(
+                push_prefix, temp_dir, qr_img.size[0], qr_img.size[1]
+            )
+            push_file = f"{push_filename}_{push_counter:05}_.png"
+            qr_img.save(os.path.join(push_folder, push_file), compress_level=1)
+            PromptServer.instance.send_sync("penplotter.qr_ready", {
+                "filename": push_file,
+                "subfolder": push_subfolder,
+                "type": "temp",
+                "public_url": public_url,
+                "token": token,
+            })
+        except Exception as e:
+            print(f"[PenPlotter] Could not push early QR update: {e}")
+
         qr_np = np.array(qr_img).astype(np.float32) / 255.0
         qr_tensor = torch.from_numpy(qr_np).unsqueeze(0)
 
         print(f"[PenPlotter] Submission token={token} public_url={public_url}")
         return (qr_tensor, public_url, token)
+
+
+class QRCodePreview:
+    """Sink node for the QR code image. Pairs with the custom frontend
+    extension in `web/qr_code_preview.js` which shows a spinner during the
+    workflow run and an error icon on failure/interrupt. Uses a custom
+    `qr_images` ui key so ComfyUI's default thumbnail strip doesn't also
+    render the image."""
+    CATEGORY = "Pen Plotter"
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.prefix_append = "_qr_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        self.compress_level = 1
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
+        }
+
+    RETURN_TYPES = ()
+    FUNCTION = "save"
+    OUTPUT_NODE = True
+
+    def save(self, image, prompt=None, extra_pnginfo=None):
+        first = image[0]
+        height, width = int(first.shape[0]), int(first.shape[1])
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            "qr_preview" + self.prefix_append, self.output_dir, width, height
+        )
+
+        results = []
+        for img_tensor in image:
+            np_img = np.clip(img_tensor.cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+            pil = Image.fromarray(np_img)
+            metadata = PngInfo()
+            if prompt is not None:
+                metadata.add_text("prompt", json.dumps(prompt))
+            if extra_pnginfo is not None:
+                for k, v in extra_pnginfo.items():
+                    metadata.add_text(k, json.dumps(v))
+            file_name = f"{filename}_{counter:05}_.png"
+            pil.save(os.path.join(full_output_folder, file_name),
+                     pnginfo=metadata, compress_level=self.compress_level)
+            results.append({"filename": file_name, "subfolder": subfolder, "type": self.type})
+            counter += 1
+
+        return {"ui": {"qr_images": results}}
 
 
 # A dictionary that contains all nodes you want to export with their names
@@ -550,7 +634,8 @@ NODE_CLASS_MAPPINGS = {
     "DisengagePlotter": DisengagePlotter,
     "ImageToFile": ImageToFile,
     "SvgToFile": SvgToFile,
-    "UploadSubmission": UploadSubmission
+    "UploadSubmission": UploadSubmission,
+    "QRCodePreview": QRCodePreview
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -561,7 +646,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DisengagePlotter": "Disengage Plotter",
     "ImageToFile": "Image to Submission File",
     "SvgToFile": "SVG to Submission File",
-    "UploadSubmission": "Upload Submission to AI Plotter"
+    "UploadSubmission": "Upload Submission to AI Plotter",
+    "QRCodePreview": "QR Code Preview"
 }
 
 # Overwrite or wrap comfy.model_management.interrupt_current_processing

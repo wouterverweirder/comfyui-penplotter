@@ -6,8 +6,11 @@ import os
 import json
 import random
 import string
+import uuid
+import threading
 from io import BytesIO
 from pathlib import Path
+from aiohttp import web
 from server import PromptServer
 import cv2
 import torch
@@ -18,10 +21,16 @@ from PIL.PngImagePlugin import PngInfo
 import folder_paths
 from .trace_skeleton import thinning, traceSkeleton
 import comfy.model_management
+from comfy_api.input_impl import VideoFromFile
 
 
 # Global variable to track the currently running subprocess for interruption
 _current_subprocess = None
+
+# Pending browser-side MP4 render jobs keyed by job_id.
+# Each entry: {"event": threading.Event, "result": str|None, "error": str|None}
+_mp4_jobs = {}
+_mp4_jobs_lock = threading.Lock()
 
 class ImageToCenterline:
     CATEGORY = "Pen Plotter"
@@ -34,9 +43,10 @@ class ImageToCenterline:
             },
             "optional": {
                 "optimize_exhaustive": ("BOOLEAN", {"default": True}),
+                "color": ("STRING", {"default": "black"}),
             }
         }
-    
+
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("svg_string",)
     FUNCTION = "convert_to_centerline"
@@ -57,9 +67,9 @@ class ImageToCenterline:
         # Convert RGB to BGR for OpenCV
         return cv2.cvtColor(np_image, cv2.COLOR_RGB2BGR)
 
-    def convert_to_centerline(self, image, optimize_exhaustive=True):
+    def convert_to_centerline(self, image, optimize_exhaustive=True, color="black"):
         """Convert image tensor to centerline SVG string."""
-            
+
         try:
 
             # create a cv2 image from PIL image
@@ -73,7 +83,7 @@ class ImageToCenterline:
             rects = []
             polys = traceSkeleton(im,0,0,im.shape[1],im.shape[0],10,999,rects)
 
-            return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{im.shape[1]}" height="{im.shape[0]}"><path stroke="red" fill="none" d="'+" ".join(
+            return (f'<svg xmlns="http://www.w3.org/2000/svg" width="{im.shape[1]}" height="{im.shape[0]}"><path stroke="{color}" fill="none" d="'+" ".join(
     ["M"+" ".join([f'{x[0]},{x[1]}' for x in y]) for y in polys]
   )+'"/></svg>',)
                     
@@ -439,6 +449,43 @@ class SvgToFile:
         },)
 
 
+class VideoToFile:
+    """Wrap a VIDEO input as a PENPLOTTER_FILE for UploadSubmission."""
+    CATEGORY = "Pen Plotter"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "name": ("STRING", {"default": "animation.mp4"}),
+            }
+        }
+
+    RETURN_TYPES = ("PENPLOTTER_FILE",)
+    RETURN_NAMES = ("file",)
+    FUNCTION = "to_file"
+
+    def to_file(self, video, name):
+        src = video.get_stream_source()
+        if isinstance(src, str):
+            with open(src, "rb") as f:
+                data = f.read()
+        else:
+            src.seek(0)
+            data = src.read()
+
+        cleaned = (name or "animation").strip() or "animation"
+        if not os.path.splitext(cleaned)[1]:
+            cleaned = f"{cleaned}.mp4"
+
+        return ({
+            "name": cleaned,
+            "bytes": data,
+            "mime": "video/mp4",
+        },)
+
+
 class UploadSubmission:
     """POST collected files to the AI Plotter Laravel backend and render the
     resulting public URL as a QR code image. The `project` widget is a label
@@ -625,6 +672,182 @@ class QRCodePreview:
         return {"ui": {"qr_images": results}}
 
 
+class VideoPreview:
+    """Sink node that plays a VIDEO inline in the graph. Pairs with
+    web/video_preview.js, which mounts a <video> element with autoplay+loop+
+    muted and reloads whenever a new render finishes."""
+    CATEGORY = "Pen Plotter"
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.prefix_append = "_vid_" + "".join(
+            random.choices(string.ascii_lowercase + string.digits, k=6)
+        )
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"video": ("VIDEO",)}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "preview"
+    OUTPUT_NODE = True
+
+    def preview(self, video):
+        os.makedirs(self.output_dir, exist_ok=True)
+        try:
+            width, height = video.get_dimensions()
+        except Exception:
+            width, height = 0, 0
+
+        full_output_folder, filename, counter, subfolder, _ = folder_paths.get_save_image_path(
+            "video_preview" + self.prefix_append,
+            self.output_dir, width, height,
+        )
+        file_name = f"{filename}_{counter:05}_.mp4"
+        out_path = os.path.join(full_output_folder, file_name)
+        video.save_to(out_path)
+
+        result = {"filename": file_name, "subfolder": subfolder, "type": self.type}
+
+        # Early push so the frontend can swap the <video src> the moment the
+        # file is on disk (mirrors the qr_ready pattern used by UploadSubmission).
+        try:
+            PromptServer.instance.send_sync(
+                "penplotter.video_ready",
+                {**result, "node_type": "VideoPreview"},
+            )
+        except Exception as e:
+            print(f"[PenPlotter] Could not push video_ready: {e}")
+
+        return {"ui": {"penplotter_videos": [result]}}
+
+
+class SvgToMp4Animation:
+    """Render an SVG line-drawing as an MP4 by delegating encoding to the
+    browser (WebCodecs VideoEncoder + mp4-muxer). The Python node blocks on
+    a per-job threading.Event while the frontend extension does the work
+    and POSTs the finished MP4 back to /penplotter/mp4_result."""
+    CATEGORY = "Pen Plotter"
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "svg": ("STRING", {"forceInput": True}),
+            },
+            "optional": {
+                "speed_px_per_sec":     ("INT",   {"default": 400,   "min": 1,    "max": 10000}),
+                "max_duration_seconds": ("FLOAT", {"default": 30.0,  "min": 1.0,  "max": 600.0, "step": 0.5}),
+                "fps":                  ("INT",   {"default": 30,    "min": 1,    "max": 120}),
+                "out_width":            ("INT",   {"default": 1280,  "min": 16,   "max": 7680}),
+                "out_height":           ("INT",   {"default": 720,   "min": 16,   "max": 4320}),
+                "bg_color":             ("STRING",{"default": "#fafafa"}),
+                "freeze_final_seconds": ("FLOAT", {"default": 1.0,   "min": 0.0,  "max": 60.0, "step": 0.1}),
+                "stroke_width":         ("FLOAT", {"default": 1.0,   "min": 0.0,  "max": 100.0, "step": 0.1}),
+            },
+        }
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "render"
+
+    def render(self, svg, speed_px_per_sec=400, max_duration_seconds=30.0, fps=30,
+               out_width=1280, out_height=720, bg_color="#fafafa", freeze_final_seconds=1.0,
+               stroke_width=1.0):
+        job_id = uuid.uuid4().hex
+        event = threading.Event()
+        with _mp4_jobs_lock:
+            _mp4_jobs[job_id] = {"event": event, "result": None, "error": None}
+
+        try:
+            PromptServer.instance.send_sync("penplotter.render_mp4", {
+                "job_id": job_id,
+                "svg": svg,
+                "settings": {
+                    "speed_px_per_sec": int(speed_px_per_sec),
+                    "max_duration_seconds": float(max_duration_seconds),
+                    "fps": int(fps),
+                    "out_width": int(out_width),
+                    "out_height": int(out_height),
+                    "bg_color": bg_color,
+                    "freeze_final_seconds": float(freeze_final_seconds),
+                    "stroke_width": float(stroke_width),
+                },
+            })
+
+            # Generous timeout: full animation length + freeze + 2 min slack
+            # for encoder warm-up and upload of larger files.
+            timeout = float(max_duration_seconds) + float(freeze_final_seconds) + 120.0
+            if not event.wait(timeout=timeout):
+                raise RuntimeError(
+                    "Timed out waiting for browser to render MP4. "
+                    "Is the ComfyUI tab open?"
+                )
+
+            with _mp4_jobs_lock:
+                job = _mp4_jobs.get(job_id)
+            if job is None:
+                raise RuntimeError("MP4 job state was lost.")
+            if job["error"]:
+                raise RuntimeError(f"Browser-side MP4 render failed: {job['error']}")
+            if not job["result"]:
+                raise RuntimeError("Browser returned no MP4 file.")
+
+            return (VideoFromFile(job["result"]),)
+        finally:
+            with _mp4_jobs_lock:
+                _mp4_jobs.pop(job_id, None)
+
+
+@PromptServer.instance.routes.post("/penplotter/mp4_result")
+async def _penplotter_receive_mp4(request):
+    reader = await request.multipart()
+    job_id = None
+    file_bytes = None
+    while True:
+        field = await reader.next()
+        if field is None:
+            break
+        if field.name == "job_id":
+            job_id = (await field.read()).decode("utf-8").strip()
+        elif field.name == "file":
+            file_bytes = await field.read()
+    if not job_id or file_bytes is None:
+        return web.json_response({"error": "missing job_id or file"}, status=400)
+
+    temp_dir = folder_paths.get_temp_directory()
+    os.makedirs(temp_dir, exist_ok=True)
+    out_path = os.path.join(temp_dir, f"penplotter_anim_{job_id}.mp4")
+    with open(out_path, "wb") as f:
+        f.write(file_bytes)
+
+    with _mp4_jobs_lock:
+        job = _mp4_jobs.get(job_id)
+        if job is not None:
+            job["result"] = out_path
+            job["event"].set()
+    return web.json_response({"ok": True})
+
+
+@PromptServer.instance.routes.post("/penplotter/mp4_error")
+async def _penplotter_receive_mp4_error(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    job_id = (payload or {}).get("job_id")
+    err = (payload or {}).get("error", "unknown error")
+    if not job_id:
+        return web.json_response({"error": "missing job_id"}, status=400)
+    with _mp4_jobs_lock:
+        job = _mp4_jobs.get(job_id)
+        if job is not None:
+            job["error"] = str(err)
+            job["event"].set()
+    return web.json_response({"ok": True})
+
+
 # A dictionary that contains all nodes you want to export with their names
 # NOTE: names should be globally unique
 NODE_CLASS_MAPPINGS = {
@@ -634,8 +857,11 @@ NODE_CLASS_MAPPINGS = {
     "DisengagePlotter": DisengagePlotter,
     "ImageToFile": ImageToFile,
     "SvgToFile": SvgToFile,
+    "VideoToFile": VideoToFile,
     "UploadSubmission": UploadSubmission,
-    "QRCodePreview": QRCodePreview
+    "QRCodePreview": QRCodePreview,
+    "VideoPreview": VideoPreview,
+    "SvgToMp4Animation": SvgToMp4Animation,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -646,8 +872,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DisengagePlotter": "Disengage Plotter",
     "ImageToFile": "Image to Submission File",
     "SvgToFile": "SVG to Submission File",
+    "VideoToFile": "Video to Submission File",
     "UploadSubmission": "Upload Submission to AI Plotter",
-    "QRCodePreview": "QR Code Preview"
+    "QRCodePreview": "QR Code Preview",
+    "VideoPreview": "Video Preview",
+    "SvgToMp4Animation": "SVG to MP4 Animation",
 }
 
 # Overwrite or wrap comfy.model_management.interrupt_current_processing
@@ -676,6 +905,14 @@ def wrapped_interrupt_current_processing(*args, **kwargs):
             except Exception as e:
                 print(f"[PenPlotter] Error terminating subprocess: {e}")
                 _current_subprocess = None
+        # Wake up any browser-side MP4 jobs that are still blocking the
+        # worker so a Cancel returns promptly instead of waiting for the
+        # full job timeout.
+        with _mp4_jobs_lock:
+            for job in _mp4_jobs.values():
+                if not job["event"].is_set():
+                    job["error"] = "interrupted"
+                    job["event"].set()
         # run the disengage command to put the plotter in a safe state
         run_axicli_disengage()
 

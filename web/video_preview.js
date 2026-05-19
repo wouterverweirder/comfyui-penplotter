@@ -61,6 +61,11 @@ app.registerExtension({
     setup() {
         api.addEventListener("penplotter.video_ready", ({ detail }) => {
             if (!detail?.filename) return;
+            if (detail.node_id != null) {
+                const node = app.graph.getNodeById(detail.node_id);
+                if (node && node.type === NODE_TYPE) setSource(node, detail);
+                return;
+            }
             for (const n of findPreviewNodes()) setSource(n, detail);
         });
 

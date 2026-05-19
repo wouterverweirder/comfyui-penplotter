@@ -77,7 +77,7 @@ function drawSpinner(ctx, x, y, w, h) {
     ctx.font = "12px Arial";
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
-    ctx.fillText("Uploading…", cx, cy + r + 10);
+    ctx.fillText("Processing…", cx, cy + r + 10);
 }
 
 function drawError(ctx, x, y, w, h) {

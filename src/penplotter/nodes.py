@@ -467,13 +467,24 @@ class VideoToFile:
     FUNCTION = "to_file"
 
     def to_file(self, video, name):
-        src = video.get_stream_source()
-        if isinstance(src, str):
-            with open(src, "rb") as f:
-                data = f.read()
-        else:
-            src.seek(0)
-            data = src.read()
+        try:
+            src = video.get_stream_source()
+            if isinstance(src, str):
+                with open(src, "rb") as f:
+                    data = f.read()
+            else:
+                src.seek(0)
+                data = src.read()
+        except Exception:
+            # VideoFromComponents (e.g. from core CreateVideo) doesn't override
+            # get_stream_source; the base default calls save_to(BytesIO()) with
+            # format=AUTO, which PyAV can't resolve. A path with a .mp4
+            # extension lets PyAV infer the container.
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path = os.path.join(tmp_dir, "out.mp4")
+                video.save_to(tmp_path)
+                with open(tmp_path, "rb") as f:
+                    data = f.read()
 
         cleaned = (name or "animation").strip() or "animation"
         if not os.path.splitext(cleaned)[1]:
@@ -687,13 +698,16 @@ class VideoPreview:
 
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"video": ("VIDEO",)}}
+        return {
+            "required": {"video": ("VIDEO",)},
+            "hidden": {"unique_id": "UNIQUE_ID"},
+        }
 
     RETURN_TYPES = ()
     FUNCTION = "preview"
     OUTPUT_NODE = True
 
-    def preview(self, video):
+    def preview(self, video, unique_id=None):
         os.makedirs(self.output_dir, exist_ok=True)
         try:
             width, height = video.get_dimensions()
@@ -715,7 +729,7 @@ class VideoPreview:
         try:
             PromptServer.instance.send_sync(
                 "penplotter.video_ready",
-                {**result, "node_type": "VideoPreview"},
+                {**result, "node_type": "VideoPreview", "node_id": unique_id},
             )
         except Exception as e:
             print(f"[PenPlotter] Could not push video_ready: {e}")

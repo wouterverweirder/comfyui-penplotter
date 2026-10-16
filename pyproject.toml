@@ -40,7 +40,7 @@ Documentation = "https://github.com/wouterverweirder/comfyui-penplotter/wiki"
 
 
 [tool.comfy]
-PublisherId = "wouterverweirder"
+PublisherId = "wouter"
 DisplayName = "ComfyUI PenPlotter"
 Icon = ""
 Tags = []

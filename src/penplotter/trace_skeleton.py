@@ -177,19 +177,25 @@ def mergeFrags(c0, c1, sx, dr):
 def chunkToFrags(im, x, y, w, h):
   frags = []
   on = False; # to deal with strokes thicker than 1px
-  li=-1; lj=-1;
+  li=-1;
+  lj=-1;
   
   # walk around the edge clockwise
   for k in range(h+h+w+w-4):
-    i=0; j=0;
+    i=0;
+    j=0;
     if (k < w):
-      i = y+0; j = x+k;
+      i = y+0;
+      j = x+k;
     elif (k < w+h-1):
-      i = y+k-w+1; j = x+w-1;
+      i = y+k-w+1;
+      j = x+w-1;
     elif (k < w+h+w-2):
-      i = y+h-1; j = x+w-(k-w-h+3); 
+      i = y+h-1;
+      j = x+w-(k-w-h+3);
     else:
-      i = y+h-(k-w-h-w+4); j = x+0;
+      i = y+h-(k-w-h-w+4);
+      j = x+0;
     
     if (im[i,j]): # found an outgoing pixel
       if (not on):     # left side of stroke
@@ -275,11 +281,13 @@ def traceSkeleton(im, x, y, w, h, csize, maxIter, rects):
       s = np.sum(im[i-1:i+1, x:x+w])
       
       if (s < ms):
-        ms = s; mi = i;
+        ms = s;
+        mi = i;
       elif (s == ms  and  abs(i-(y+h//2))<abs(mi-(y+h//2))):
         # if there is a draw (very common), we want the seam to be near the middle
         # to balance the divide and conquer tree
-        ms = s; mi = i;
+        ms = s;
+        mi = i;
   
   if (w > csize): # same as above, try splitting left and right
     for j in range(x+3,x+w-2):
